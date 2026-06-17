@@ -1,0 +1,11 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "core/test/unit/metaculus.test.ts",
+    "core/test/unit/server-api.test.ts",
+    "core/test/unit/fetchMarketAndEvent.test.ts",
+    "core/test/utils/market-utils.test.ts"
+  ],
+  "validation_test_file_count": 4,
+  "validation_tests_executed": null
+}
