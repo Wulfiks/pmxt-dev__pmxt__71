@@ -1,0 +1,721 @@
+import { AssetType, Side } from '@polymarket/clob-client';
+import type { SignedOrder } from '@polymarket/order-utils';
+import { createHmac } from 'crypto';
+import {
+    EventFetchParams,
+    ExchangeCredentials,
+    HistoryFilterParams,
+    MarketFilterParams,
+    MyTradesParams,
+    OHLCVParams,
+    PredictionMarketExchange,
+    TradesParams,
+} from '../../BaseExchange';
+import { AuthenticationError } from '../../errors';
+import { SubscribedAddressSnapshot, SubscriptionOption } from '../../subscriber/base';
+import { buildPolymarketTradesActivity, POLYMARKET_DEFAULT_SUBSCRIPTION } from '../../subscriber/external/goldsky';
+import { WatcherConfig } from '../../subscriber/watcher';
+import {
+    Balance,
+    BuiltOrder,
+    CreateOrderParams,
+    Order,
+    OrderBook,
+    Position,
+    PriceCandle,
+    Trade,
+    UnifiedEvent,
+    UnifiedMarket,
+    UserTrade,
+} from '../../types';
+import { parseOpenApiSpec } from '../../utils/openapi';
+import { validateIdFormat, validateOutcomeId } from '../../utils/validation';
+import { FetcherContext } from '../interfaces';
+import { polymarketClobSpec } from './api-clob';
+import { polymarketDataSpec } from './api-data';
+import { polymarketGammaSpec } from './api-gamma';
+import { PolymarketAuth } from './auth';
+import { polymarketErrorMapper } from './errors';
+import { PolymarketFetcher } from './fetcher';
+import { PolymarketNormalizer } from './normalizer';
+import { PolymarketWebSocket, PolymarketWebSocketConfig } from './websocket';
+
+// Re-export for external use
+export type { PolymarketWebSocketConfig, WatcherConfig };
+export { POLYMARKET_DEFAULT_SUBSCRIPTION, buildPolymarketTradesActivity };
+
+export interface PolymarketExchangeOptions {
+    credentials?: ExchangeCredentials;
+    websocket?: PolymarketWebSocketConfig;
+}
+
+export class PolymarketExchange extends PredictionMarketExchange {
+    override readonly has = {
+        fetchMarkets: true as const,
+        fetchEvents: true as const,
+        fetchOHLCV: true as const,
+        fetchOrderBook: true as const,
+        fetchTrades: true as const,
+        createOrder: true as const,
+        cancelOrder: true as const,
+        fetchOrder: true as const,
+        fetchOpenOrders: true as const,
+        fetchPositions: true as const,
+        fetchBalance: true as const,
+        watchAddress: true as const,
+        unwatchAddress: true as const,
+        watchOrderBook: true as const,
+        watchTrades: true as const,
+        fetchMyTrades: true as const,
+        fetchClosedOrders: false as const,
+        fetchAllOrders: false as const,
+        buildOrder: true as const,
+        submitOrder: true as const,
+    };
+
+    private auth?: PolymarketAuth;
+    private wsConfig?: PolymarketWebSocketConfig;
+    private cachedApiCreds?: { key: string; secret: string; passphrase: string };
+    private cachedAddress?: string;
+    private ws?: PolymarketWebSocket;
+    private readonly fetcher: PolymarketFetcher;
+    private readonly normalizer: PolymarketNormalizer;
+
+    constructor(options?: ExchangeCredentials | PolymarketExchangeOptions) {
+        // Support both old signature (credentials only) and new signature (options object)
+        let credentials: ExchangeCredentials | undefined;
+        let wsConfig: PolymarketWebSocketConfig | undefined;
+
+        if (options && 'credentials' in options) {
+            // New signature: PolymarketExchangeOptions
+            credentials = options.credentials;
+            wsConfig = options.websocket;
+        } else {
+            // Old signature: ExchangeCredentials directly
+            credentials = options as ExchangeCredentials | undefined;
+        }
+
+        super(credentials);
+        this.rateLimit = 200;
+        this.wsConfig = wsConfig;
+
+        // Add browser-mimicking headers to help pass Cloudflare bot detection on the Gamma API.
+        // Origin/Referer make requests look like same-site CORS calls from the Polymarket frontend.
+        Object.assign(this.http.defaults.headers.common, {
+            'Accept': 'application/json, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://polymarket.com',
+            'Referer': 'https://polymarket.com/',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-site',
+        });
+
+        // Initialize auth if credentials are provided
+        if (credentials?.privateKey) {
+            this.auth = new PolymarketAuth(credentials);
+        }
+
+        // If L2 API creds are provided directly, cache them for sync sign()
+        if (credentials?.apiKey && credentials?.apiSecret && credentials?.passphrase) {
+            this.cachedApiCreds = {
+                key: credentials.apiKey,
+                secret: credentials.apiSecret,
+                passphrase: credentials.passphrase,
+            };
+        }
+
+        // Register implicit APIs for all 3 Polymarket services
+        const clobDescriptor = parseOpenApiSpec(polymarketClobSpec);
+        this.defineImplicitApi(clobDescriptor);
+
+        const gammaDescriptor = parseOpenApiSpec(polymarketGammaSpec);
+        this.defineImplicitApi(gammaDescriptor);
+
+        const dataDescriptor = parseOpenApiSpec(polymarketDataSpec);
+        this.defineImplicitApi(dataDescriptor);
+
+        // Initialize fetcher + normalizer layers
+        const ctx: FetcherContext = {
+            http: this.http,
+            callApi: this.callApi.bind(this),
+            getHeaders: () => ({}),
+        };
+
+        this.fetcher = new PolymarketFetcher(ctx, this.http);
+        this.normalizer = new PolymarketNormalizer();
+    }
+
+    get name(): string {
+        return 'Polymarket';
+    }
+
+    // ----------------------------------------------------------------------------
+    // Implicit API Auth & Error Mapping
+    // ----------------------------------------------------------------------------
+
+    /**
+     * Initialize L2 API credentials for implicit API signing.
+     * Must be called before using private implicit API endpoints if only
+     * a privateKey was provided (not apiKey/apiSecret/passphrase).
+     */
+    async initAuth(): Promise<void> {
+        const auth = this.ensureAuth();
+        const creds = await auth.getApiCredentials();
+        this.cachedApiCreds = {
+            key: creds.key,
+            secret: creds.secret,
+            passphrase: creds.passphrase,
+        };
+        this.cachedAddress = auth.getFunderAddress();
+    }
+
+    async fetchOHLCV(id: string, params: OHLCVParams): Promise<PriceCandle[]> {
+        validateIdFormat(id, 'OHLCV');
+        validateOutcomeId(id, 'OHLCV');
+        if (!params.resolution) {
+            throw new Error('fetchOHLCV requires a resolution parameter. Use OHLCVParams with resolution specified.');
+        }
+        const raw = await this.fetcher.fetchRawOHLCV(id, params);
+        return this.normalizer.normalizeOHLCV(raw, params);
+    }
+
+    async fetchOrderBook(id: string): Promise<OrderBook> {
+        validateIdFormat(id, 'OrderBook');
+        validateOutcomeId(id, 'OrderBook');
+        const raw = await this.fetcher.fetchRawOrderBook(id);
+        return this.normalizer.normalizeOrderBook(raw, id);
+    }
+
+    async fetchTrades(id: string, params: TradesParams | HistoryFilterParams): Promise<Trade[]> {
+        validateIdFormat(id, 'Trades');
+        validateOutcomeId(id, 'Trades');
+        if ('resolution' in params && params.resolution !== undefined) {
+            console.warn(
+                '[pmxt] Warning: The "resolution" parameter is deprecated for fetchTrades() and will be ignored. ' +
+                'It will be removed in v3.0.0. Please remove it from your code.',
+            );
+        }
+        const rawTrades = await this.fetcher.fetchRawTrades(id, params);
+        const mappedTrades = rawTrades.map((raw: any, i: number) => this.normalizer.normalizeTrade(raw, i));
+        if (params.limit && mappedTrades.length > params.limit) {
+            return mappedTrades.slice(0, params.limit);
+        }
+        return mappedTrades;
+    }
+
+    /**
+     * Pre-warm the SDK's internal caches for a market outcome.
+     *
+     * Fetches tick size, fee rate, and neg-risk in parallel so that subsequent
+     * `createOrder` calls skip those lookups and hit only `POST /order`.
+     * Call this when you start watching a market.
+     *
+     * @param outcomeId - The CLOB Token ID for the outcome (use `outcome.outcomeId`)
+     *
+     * @example-ts Pre-warm before placing orders
+     * const markets = await exchange.fetchMarkets({ query: 'Trump' });
+     * const outcomeId = markets[0].outcomes[0].outcomeId;
+     * await exchange.preWarmMarket(outcomeId);
+     * // Subsequent createOrder calls are faster
+     *
+     * @example-python Pre-warm before placing orders
+     * markets = exchange.fetch_markets(query='Trump')
+     * outcome_id = markets[0].outcomes[0].outcome_id
+     * exchange.pre_warm_market(outcome_id)
+     * # Subsequent create_order calls are faster
+     */
+    async preWarmMarket(outcomeId: string): Promise<void> {
+        const auth = this.ensureAuth();
+        const client = await auth.getClobClient();
+        await Promise.all([
+            client.getTickSize(outcomeId),
+            client.getFeeRateBps(outcomeId),
+            client.getNegRisk(outcomeId),
+        ]);
+    }
+
+    async buildOrder(params: CreateOrderParams): Promise<BuiltOrder> {
+        try {
+            const auth = this.ensureAuth();
+            const client = await auth.getClobClient();
+
+            const side = params.side.toUpperCase() === 'BUY' ? Side.BUY : Side.SELL;
+            const price = params.price || (side === Side.BUY ? 0.99 : 0.01);
+            const tickSize = params.tickSize ? params.tickSize.toString() : undefined;
+
+            const orderArgs: any = {
+                tokenID: params.outcomeId,
+                price,
+                side,
+                size: params.amount,
+            };
+            if (params.fee != null) orderArgs.feeRateBps = params.fee;
+
+            const options: any = {};
+            if (tickSize) options.tickSize = tickSize;
+            if (params.negRisk !== undefined) options.negRisk = params.negRisk;
+
+            const signedOrder = await client.createOrder(orderArgs, options);
+
+            return {
+                exchange: this.name,
+                params,
+                signedOrder: signedOrder as Record<string, unknown>,
+                raw: signedOrder,
+            };
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    async submitOrder(built: BuiltOrder): Promise<Order> {
+        try {
+            const auth = this.ensureAuth();
+            const client = await auth.getClobClient();
+
+            const response = await client.postOrder(built.raw as SignedOrder);
+
+            if (!response || !response.success) {
+                throw new Error(`${response?.errorMsg || 'Order submission failed'} (Response: ${JSON.stringify(response)})`);
+            }
+
+            const side = built.params.side.toUpperCase() === 'BUY' ? Side.BUY : Side.SELL;
+            const price = built.params.price || (side === Side.BUY ? 0.99 : 0.01);
+            return {
+                id: response.orderID,
+                marketId: built.params.marketId,
+                outcomeId: built.params.outcomeId,
+                side: built.params.side,
+                type: built.params.type,
+                price,
+                amount: built.params.amount,
+                status: 'open',
+                filled: 0,
+                remaining: built.params.amount,
+                fee: built.params.fee,
+                timestamp: Date.now(),
+            };
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    async createOrder(params: CreateOrderParams): Promise<Order> {
+        const built = await this.buildOrder(params);
+        return this.submitOrder(built);
+    }
+
+    async cancelOrder(orderId: string): Promise<Order> {
+        try {
+            const auth = this.ensureAuth();
+            const client = await auth.getClobClient();
+
+            await client.cancelOrder({ orderID: orderId });
+
+            return {
+                id: orderId,
+                marketId: 'unknown',
+                outcomeId: 'unknown',
+                side: 'buy',
+                type: 'limit',
+                amount: 0,
+                status: 'cancelled',
+                filled: 0,
+                remaining: 0,
+                timestamp: Date.now(),
+            };
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    async fetchOrder(orderId: string): Promise<Order> {
+        try {
+            const auth = this.ensureAuth();
+            const client = await auth.getClobClient();
+
+            const order = await client.getOrder(orderId);
+            if (!order || !order.id) {
+                const errorMsg = (order as any)?.error || 'Order not found (Invalid ID)';
+                throw new Error(errorMsg);
+            }
+            return {
+                id: order.id,
+                marketId: order.market || 'unknown',
+                outcomeId: order.asset_id,
+                side: (order.side || '').toLowerCase() as 'buy' | 'sell',
+                type: order.order_type === 'GTC' ? 'limit' : 'market',
+                price: parseFloat(order.price),
+                amount: parseFloat(order.original_size),
+                status: (typeof order.status === 'string' ? order.status.toLowerCase() : order.status) as any,
+                filled: parseFloat(order.size_matched),
+                remaining: parseFloat(order.original_size) - parseFloat(order.size_matched),
+                timestamp: order.created_at * 1000,
+            };
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    async fetchOpenOrders(marketId?: string): Promise<Order[]> {
+        try {
+            const auth = this.ensureAuth();
+            const client = await auth.getClobClient();
+
+            const orders = await client.getOpenOrders({
+                market: marketId,
+            });
+
+            return orders.map((o: any) => ({
+                id: o.id,
+                marketId: o.market || 'unknown',
+                outcomeId: o.asset_id,
+                side: o.side.toLowerCase() as 'buy' | 'sell',
+                type: 'limit',
+                price: parseFloat(o.price),
+                amount: parseFloat(o.original_size),
+                status: 'open',
+                filled: parseFloat(o.size_matched),
+                remaining: parseFloat(o.size_left || (parseFloat(o.original_size) - parseFloat(o.size_matched))),
+                timestamp: o.created_at * 1000,
+            }));
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    async fetchUserTrades(address: string, params?: MyTradesParams): Promise<UserTrade[]> {
+        const rawTrades = await this.fetcher.fetchRawMyTrades(params || {}, address);
+        return rawTrades.map((raw: any, i: number) => this.normalizer.normalizeUserTrade(raw, i));
+    }
+
+    async fetchMyTrades(params?: MyTradesParams): Promise<UserTrade[]> {
+        const auth = this.ensureAuth();
+        const address = await auth.getEffectiveFunderAddress();
+        return this.fetchUserTrades(address, params);
+    }
+
+    async fetchPositions(address?: string): Promise<Position[]> {
+        try {
+            let usrAddress: string;
+            if (address) {
+                usrAddress = address;
+            } else {
+                const auth = this.ensureAuth();
+                usrAddress = await auth.getEffectiveFunderAddress();
+            }
+            const rawPositions = await this.fetcher.fetchRawPositions(usrAddress);
+            return rawPositions.map((raw: any) => this.normalizer.normalizePosition(raw));
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    async fetchBalance(address?: string): Promise<Balance[]> {
+        try {
+            if (address) {
+                return await this.getAddressOnChainBalance(address);
+            }
+
+            // Authenticated path: use CLOB client + on-chain fallback for own wallet.
+            const auth = this.ensureAuth();
+            const client = await auth.getClobClient();
+
+            // Polymarket relies strictly on USDC (Polygon)
+            const USDC_DECIMALS = 6;
+
+            // Try fetching from CLOB client first
+            let total = 0;
+            try {
+                const balRes = await client.getBalanceAllowance({
+                    asset_type: AssetType.COLLATERAL,
+                });
+                const rawBalance = parseFloat(balRes.balance);
+                total = rawBalance / Math.pow(10, USDC_DECIMALS);
+            } catch (clobError) {
+                // If CLOB fails or returns 0 (suspiciously), we can try on-chain
+                // but let's assume we proceed to on-chain check if total is 0
+                // or just do on-chain check always for robustness if possible.
+                // For now, let's trust CLOB but add On-Chain fallback if CLOB returns 0.
+            }
+
+            // On-Chain Fallback/Check (Robustness)
+            // If CLOB reported 0, let's verify on-chain because sometimes CLOB is behind or confused about proxies
+            if (total === 0) {
+                try {
+                    const targetAddress = await auth.getEffectiveFunderAddress();
+                    const balances = await this.getAddressOnChainBalance(targetAddress);
+                    total = balances[0]?.total ?? 0;
+                } catch {
+                }
+            }
+
+            // 2. Fetch open orders to calculate locked funds
+            // We only care about BUY orders for USDC balance locking
+            const openOrders = await client.getOpenOrders({});
+
+            let locked = 0;
+            if (openOrders && Array.isArray(openOrders)) {
+                for (const order of openOrders) {
+                    if (order.side === Side.BUY) {
+                        const remainingSize = parseFloat(order.original_size) - parseFloat(order.size_matched);
+                        const price = parseFloat(order.price);
+                        locked += remainingSize * price;
+                    }
+                }
+            }
+
+            return [{
+                currency: 'USDC',
+                total: total,
+                available: total - locked, // Available for new trades
+                locked: locked,
+            }];
+        } catch (error: any) {
+            throw polymarketErrorMapper.mapError(error);
+        }
+    }
+
+    // ----------------------------------------------------------------------------
+    // WebSocket Methods
+    // ----------------------------------------------------------------------------
+
+
+    async watchOrderBook(id: string, limit?: number): Promise<OrderBook> {
+        return this.ensureWs().watchOrderBook(id);
+    }
+
+    async watchTrades(id: string, address?: string, since?: number, limit?: number): Promise<Trade[]> {
+        return this.ensureWs().watchTrades(id, address);
+    }
+
+    async watchAddress(
+        address: string,
+        types: SubscriptionOption[] = ['trades', 'positions', 'balances'],
+    ): Promise<SubscribedAddressSnapshot> {
+        return this.ensureWs().watchAddress(address, types);
+    }
+
+    async unwatchAddress(address: string): Promise<void> {
+        return this.ensureWs().unwatchAddress(address);
+    }
+
+    async close(): Promise<void> {
+        if (this.ws) {
+            await this.ws.close();
+            this.ws = undefined;
+        }
+    }
+
+
+    protected override sign(method: string, path: string, _params: Record<string, any>): Record<string, string> {
+        if (!this.cachedApiCreds) {
+            throw new AuthenticationError(
+                'API credentials not initialized. Either provide apiKey/apiSecret/passphrase ' +
+                'in credentials, or call initAuth() before using private implicit API endpoints.',
+                'Polymarket',
+            );
+        }
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const message = timestamp + method.toUpperCase() + path;
+
+        // Decode the base64url secret
+        const secretB64 = this.cachedApiCreds.secret
+            .replace(/-/g, '+')
+            .replace(/_/g, '/');
+        const secretBuffer = Buffer.from(secretB64, 'base64');
+
+        // HMAC-SHA256 -> base64url
+        const hmac = createHmac('sha256', secretBuffer);
+        hmac.update(message);
+        const signature = hmac.digest('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_');
+
+        return {
+            'POLY_ADDRESS': this.cachedAddress || (this.auth ? this.auth.getFunderAddress() : ''),
+            'POLY_SIGNATURE': signature,
+            'POLY_TIMESTAMP': timestamp,
+            'POLY_API_KEY': this.cachedApiCreds.key,
+            'POLY_PASSPHRASE': this.cachedApiCreds.passphrase,
+        };
+    }
+
+    protected override mapImplicitApiError(error: any): any {
+        throw polymarketErrorMapper.mapError(error);
+    }
+
+    // ----------------------------------------------------------------------------
+    // Implementation methods for CCXT-style API
+    // ----------------------------------------------------------------------------
+
+    protected async fetchMarketsImpl(params?: MarketFilterParams): Promise<UnifiedMarket[]> {
+        const rawEvents = await this.fetcher.fetchRawMarkets(params);
+
+        const unifiedMarkets: UnifiedMarket[] = [];
+        const useQuestionFallback = !!(params?.marketId || params?.slug || params?.eventId);
+
+        for (const event of rawEvents) {
+            const markets = this.normalizer.normalizeMarketsFromEvent(event, { useQuestionAsCandidateFallback: useQuestionFallback });
+            unifiedMarkets.push(...markets);
+        }
+
+        // For outcomeId filtering (no direct API, fetch and filter)
+        if (params?.outcomeId) {
+            return unifiedMarkets.filter(m =>
+                m.outcomes.some(o => o.outcomeId === params.outcomeId),
+            );
+        }
+
+        // For query-based search, apply client-side filtering on market title
+        if (params?.query) {
+            const lowerQuery = params.query.toLowerCase();
+            const searchIn = params?.searchIn || 'title';
+            const filtered = unifiedMarkets.filter(m => {
+                const titleMatch = (m.title || '').toLowerCase().includes(lowerQuery);
+                const descMatch = (m.description || '').toLowerCase().includes(lowerQuery);
+                if (searchIn === 'title') return titleMatch;
+                if (searchIn === 'description') return descMatch;
+                return titleMatch || descMatch;
+            });
+            return filtered.slice(0, params?.limit || 250000);
+        }
+
+        // Client-side sort for default/non-search paths
+        if (params?.sort === 'volume') {
+            unifiedMarkets.sort((a, b) => b.volume24h - a.volume24h);
+        } else if (params?.sort === 'liquidity') {
+            unifiedMarkets.sort((a, b) => b.liquidity - a.liquidity);
+        } else if (!params?.marketId && !params?.slug && !params?.eventId) {
+            unifiedMarkets.sort((a, b) => b.volume24h - a.volume24h);
+        }
+
+        return unifiedMarkets.slice(0, params?.limit || 250000);
+    }
+
+    protected async fetchEventsImpl(params: EventFetchParams): Promise<UnifiedEvent[]> {
+        if (params.eventId || params.slug) {
+            // Use implicit API for eventId/slug lookup (listEvents)
+            const queryParams = params.eventId ? { id: params.eventId } : { slug: params.slug };
+            const events = await this.callApi('listEvents', queryParams);
+            return (events || []).map((event: any) => this.normalizer.normalizeEvent(event)).filter((e: UnifiedEvent | null): e is UnifiedEvent => e !== null);
+        }
+        const rawEvents = await this.fetcher.fetchRawEvents(params);
+        return rawEvents
+            .map((raw) => this.normalizer.normalizeEvent(raw))
+            .filter((e): e is UnifiedEvent => e !== null)
+            .slice(0, params.limit || 10000);
+    }
+
+    /**
+     * Ensure authentication is initialized before trading operations.
+     */
+    private ensureAuth(): PolymarketAuth {
+        if (!this.auth) {
+            throw new AuthenticationError(
+                'Trading operations require authentication. ' +
+                'Initialize PolymarketExchange with credentials: new PolymarketExchange({ privateKey: "0x..." })',
+                'Polymarket',
+            );
+        }
+        return this.auth;
+    }
+
+    /** Fetch on-chain USDC balance on Polygon for any address without requiring credentials. */
+    private async getAddressOnChainBalance(address: string): Promise<Balance[]> {
+        const { ethers } = require('ethers');
+
+        if (!ethers.utils.isAddress(address)) {
+            throw new Error(`Invalid address: ${address}`);
+        }
+        const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+        const usdcAddress = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e (Bridged)
+        const usdcAbi = [
+            'function balanceOf(address) view returns (uint256)',
+            'function decimals() view returns (uint8)',
+        ];
+        const usdcContract = new ethers.Contract(usdcAddress, usdcAbi, provider);
+        const rawBalance = await usdcContract.balanceOf(address);
+        const decimals = await usdcContract.decimals();
+        const total = parseFloat(ethers.utils.formatUnits(rawBalance, decimals));
+        return [{ currency: 'USDC', total, available: total, locked: 0 }];
+    }
+
+    private ensureWs(): PolymarketWebSocket {
+        if (!this.ws) {
+            this.ws = new PolymarketWebSocket(this.callApi.bind(this), this.wsConfig);
+        }
+        return this.ws;
+    }
+
+    private async fetchWatchedAddressActivity(params: {
+        address: string,
+        types: SubscriptionOption[]
+    }): Promise<SubscribedAddressSnapshot> {
+        const address = params.address;
+        const types = params.types;
+
+        const result: SubscribedAddressSnapshot = { address, timestamp: Date.now() };
+        const fetches: Promise<void>[] = [];
+
+        if (types.includes('trades')) {
+            fetches.push(
+                this.callApi('getTrades', { user: address, limit: 20 })
+                    .then((data: any) => {
+                        const raw = Array.isArray(data) ? data : (data?.data ?? []);
+                        result.trades = raw.map((t: any) => ({
+                            id: t.id || t.transactionHash || String(t.timestamp),
+                            timestamp: typeof t.timestamp === 'number' ? t.timestamp * 1000 : Date.now(),
+                            price: parseFloat(t.price || '0'),
+                            amount: parseFloat(t.size || t.amount || '0'),
+                            side: t.side === 'BUY' ? 'buy' as const
+                                : t.side === 'SELL' ? 'sell' as const
+                                    : 'unknown' as const,
+                            outcomeId: t.asset ?? undefined,
+                        }));
+                    })
+                    .catch(() => {
+                        result.trades = [];
+                    }),
+            );
+        }
+
+        if (types.includes('positions')) {
+            fetches.push(
+                this.callApi('getPositions', { user: address, limit: 100 })
+                    .then((data: any) => {
+                        const raw = Array.isArray(data) ? data : [];
+                        result.positions = raw.map((p: any) => ({
+                            marketId: p.conditionId,
+                            outcomeId: p.asset,
+                            outcomeLabel: p.outcome || 'Unknown',
+                            size: parseFloat(p.size),
+                            entryPrice: parseFloat(p.avgPrice),
+                            currentPrice: parseFloat(p.curPrice || '0'),
+                            unrealizedPnL: parseFloat(p.cashPnl || '0'),
+                            realizedPnL: parseFloat(p.realizedPnl || '0'),
+                        }));
+                    })
+                    .catch(() => {
+                        result.positions = [];
+                    }),
+            );
+        }
+
+        if (types.includes('balances')) {
+            fetches.push(
+                this.getAddressOnChainBalance(address)
+                    .then(b => {
+                        result.balances = b;
+                    })
+                    .catch(() => {
+                        result.balances = [];
+                    }),
+            );
+        }
+
+        await Promise.all(fetches);
+        return result;
+    }
+}

@@ -1,0 +1,12 @@
+{
+  "test_validation_mode": "subset",
+  "validation_test_files": [
+    "core/test/utils/math.test.ts",
+    "core/test/utils/market-utils.test.ts",
+    "core/test/unit/throttler.test.ts",
+    "core/test/unit/validation.test.ts",
+    "core/test/unit/types.test.ts"
+  ],
+  "validation_test_file_count": 5,
+  "validation_tests_executed": 5
+}
