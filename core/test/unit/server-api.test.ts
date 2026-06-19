@@ -61,6 +61,16 @@ jest.mock('../../src/exchanges/myriad', () => ({
     MyriadExchange: myriadCtor,
 }));
 
+const opinionCtor = jest.fn().mockImplementation(() => mockInstance);
+jest.mock('../../src/exchanges/opinion', () => ({
+    OpinionExchange: opinionCtor,
+}));
+
+const metaculusCtor = jest.fn().mockImplementation(() => mockInstance);
+jest.mock('../../src/exchanges/metaculus', () => ({
+    MetaculusExchange: metaculusCtor,
+}));
+
 // Suppress console.error noise from the Express error handler
 jest.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -396,5 +406,21 @@ describe('Credentials routing', () => {
 
         // Singleton: constructor called only once for initial creation
         expect(baoziCtor.mock.calls.length - initialCalls).toBe(1);
+    });
+
+    test('apiToken in credentials creates per-request metaculus instance', async () => {
+        const initialCalls = metaculusCtor.mock.calls.length;
+
+        await request(server)
+            .post('/api/metaculus/fetchMarkets')
+            .set('x-pmxt-access-token', TEST_TOKEN)
+            .send({ args: [], credentials: { apiToken: 'tok-1' } });
+
+        await request(server)
+            .post('/api/metaculus/fetchMarkets')
+            .set('x-pmxt-access-token', TEST_TOKEN)
+            .send({ args: [], credentials: { apiToken: 'tok-2' } });
+
+        expect(metaculusCtor.mock.calls.length - initialCalls).toBe(2);
     });
 });
